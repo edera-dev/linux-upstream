@@ -171,6 +171,15 @@ config VIRTIO_MMIO_CMDLINE_DEVICES
 
 	 If unsure, say 'N'.
 
+config VIRTIO_XENBUS
+	tristate "Platform bus driver for Xenbus virtio devices"
+	select VIRTIO
+	help
+	 This drivers provides support for the Xenbus virtio
+	 platform device driver.
+
+	 If unsure, say N.
+
 config VIRTIO_DMA_SHARED_BUFFER
 	tristate
 	depends on DMA_SHARED_BUFFER
