@@ -13,6 +13,8 @@
 #include <linux/virtio_config.h>
 #include <linux/virtio_ring.h>
 
+#include <xen/events.h>
+#include <xen/grant_table.h>
 #include <xen/xen.h>
 #include <xen/xenbus.h>
 
@@ -26,6 +28,7 @@ struct virtio_xenbus_device {
 	struct virtio_device vio_dev;
 	struct xenbus_device *xb_dev;
 
+	int conf_gntref;
 	struct virtio_config_page *config_page;
 
 	spinlock_t irq_lock;
@@ -35,6 +38,8 @@ struct virtio_xenbus_device {
 
 	spinlock_t vq_lock;
 	struct list_head virtq;
+
+	char phys[32];
 };
 
 static struct virtio_xenbus_device *to_vx_device(struct virtio_device *vdev)
@@ -52,12 +57,134 @@ static void virtio_xenbus_release_dev(struct device *_d)
 }
 
 #define NOT_IMPL pr_crit("%s: not implemented\n", __func__)
+#define TRACE(fmt, ...) pr_info("%s: " fmt "\n", __func__, ##__VA_ARGS__)
 
-static int virtio_xenbus_connect_backend(struct xenbus_device *xbdev,
+static irqreturn_t vx_interrupt(int irq, void *opaque)
+{
+	TRACE("enter");
+	return IRQ_HANDLED;
+
+#if 0 // FIXME:
+	struct virtio_xenbus_device *vx_dev = opaque;
+	u8 isr;
+	irqreturn_t ret;
+
+	/* reading the ISR has the effect of also clearing it so it's very
+	 * important to save the value. */
+	isr = vxread8(vx_dev, VIRTIO_XENBUS_ISR);
+
+	/* It's definitely not us if the ISR was not high */
+	if (!isr)
+		return IRQ_NONE;
+
+	/* Configuration change? Tell driver if it wants to know. */
+	if (isr & VIRTIO_XENBUS_ISR_CONFIG)
+		vx_config_changed(irq, opaque);
+
+	ret = vx_vring_interrupt(irq, opaque);
+
+	return ret;
+#endif
+}
+
+static irqreturn_t vx_conf_handler(int irq, void *data)
+{
+	TRACE("enter");
+	return IRQ_HANDLED;
+}
+
+static int virtio_xenbus_connect_backend(struct xenbus_device *xb_dev,
 					 struct virtio_xenbus_device *vx_dev)
 {
-	NOT_IMPL;
+	TRACE("enter");
+
+	int ret;
+	int evtchn;
+	struct xenbus_transaction xbt;
+
+	ret = gnttab_grant_foreign_access(xb_dev->otherend_id,
+					  virt_to_mfn(vx_dev->config_page),
+					  0 /* W */);
+	if (ret < 0)
+		return ret;
+	vx_dev->conf_gntref = ret;
+	TRACE("conf_gntref = %d", ret);
+
+	ret = xenbus_alloc_evtchn(xb_dev, &evtchn);
+	if (ret)
+		goto error_grant;
+	vx_dev->notify_evtchn = evtchn;
+	TRACE("notify_evtchn = %d", evtchn);
+
+	ret = bind_evtchn_to_irqhandler(evtchn, vx_interrupt, 0,
+					xb_dev->devicetype, vx_dev);
+	if (ret < 0)
+		goto error_notify_evtchn;
+	vx_dev->notify_irq = ret;
+	TRACE("notify_irq = %d", ret);
+
+	ret = xenbus_alloc_evtchn(xb_dev, &evtchn);
+	if (ret)
+		goto error_irqh;
+	vx_dev->conf_evtchn = evtchn;
+	TRACE("conf_evtchn = %d", evtchn);
+
+	ret = bind_evtchn_to_irqhandler(evtchn, vx_conf_handler, 0,
+					xb_dev->devicetype, vx_dev);
+	if (ret < 0)
+		goto error_conf_evtchn;
+	vx_dev->conf_irq = ret;
+	TRACE("conf_irq = %d", ret);
+
+again:
+	ret = xenbus_transaction_start(&xbt);
+	if (ret)
+		goto error_conf_irqh;
+	ret = xenbus_printf(xbt, xb_dev->nodename, "conf-mfn", "%lu",
+			    virt_to_mfn(vx_dev->config_page));
+	if (ret)
+		goto error_xenbus;
+	ret = xenbus_printf(xbt, xb_dev->nodename, "conf-gntref", "%u",
+			    vx_dev->conf_gntref);
+	if (ret)
+		goto error_xenbus;
+	ret = xenbus_printf(xbt, xb_dev->nodename, "conf-evtchn", "%u",
+			    vx_dev->conf_evtchn);
+	if (ret)
+		goto error_xenbus;
+	ret = xenbus_printf(xbt, xb_dev->nodename, "notify-evtchn", "%u",
+			    vx_dev->notify_evtchn);
+	if (ret)
+		goto error_xenbus;
+	ret = xenbus_transaction_end(xbt, 0);
+	if (ret) {
+		if (ret == -EAGAIN)
+			goto again;
+		goto error_conf_irqh;
+	}
+	xenbus_switch_state(xb_dev, XenbusStateInitialised);
+
 	return 0;
+
+error_xenbus:
+	xenbus_transaction_end(xbt, 1);
+	xenbus_dev_fatal(xb_dev, ret, "writing xenstore");
+error_conf_irqh:
+	unbind_from_irqhandler(vx_dev->conf_irq, vx_dev);
+	vx_dev->conf_irq = -1;
+error_conf_evtchn:
+	xenbus_free_evtchn(xb_dev, vx_dev->conf_evtchn);
+	vx_dev->conf_evtchn = -1;
+error_irqh:
+	unbind_from_irqhandler(vx_dev->notify_irq, vx_dev);
+	vx_dev->notify_irq = -1;
+error_notify_evtchn:
+	xenbus_free_evtchn(xb_dev, vx_dev->notify_evtchn);
+	vx_dev->notify_evtchn = -1;
+error_grant:
+	gnttab_end_foreign_access_ref(vx_dev->conf_gntref);
+	vx_dev->conf_gntref = -1;
+	return ret;
 }
 
 static void vx_get(struct virtio_device *vdev, unsigned offset,
@@ -158,9 +285,9 @@ static int xen_virtio_probe(struct xenbus_device *xb_dev,
 	vx_dev->conf_irq = -1;
 	vx_dev->notify_evtchn = -1;
 	vx_dev->conf_evtchn = -1;
-	// vx_dev->gref = -1;
-	// snprintf(vx_dev->phys, sizeof(vx_dev->phys), "xenbus/%s",
-		 // xb_dev->nodename);
+	vx_dev->conf_gntref = -1;
+	snprintf(vx_dev->phys, sizeof(vx_dev->phys), "xenbus/%s",
+		 xb_dev->nodename);
 
 	INIT_LIST_HEAD(&vx_dev->virtq);
 	spin_lock_init(&vx_dev->vq_lock);
@@ -173,9 +300,9 @@ static int xen_virtio_probe(struct xenbus_device *xb_dev,
 		goto err_drvdata;
 	}
 
-	// ret = virtio_xenbus_connect_backend(xb_dev, vx_dev);
-	// if (ret < 0)
-	// 	goto err_conf;
+	ret = virtio_xenbus_connect_backend(xb_dev, vx_dev);
+	if (ret < 0)
+		goto err_conf;
 
 	return 0;
 
