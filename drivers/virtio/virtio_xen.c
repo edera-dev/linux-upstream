@@ -22,7 +22,7 @@ MODULE_DESCRIPTION("virtio over xenbus");
 MODULE_AUTHOR("Edera");
 MODULE_LICENSE("GPL");
 
-static const struct xenbus_device_id xen_virtio_ids[] = { { "xen-virtio" }, { "" } };
+static const struct xenbus_device_id xen_virtio_ids[] = { { "virtio-fs" }, { "" } };
 
 struct virtio_xenbus_device {
 	struct virtio_device vio_dev;
@@ -56,8 +56,8 @@ static void virtio_xenbus_release_dev(struct device *_d)
 	kfree(vx_dev);
 }
 
-#define NOT_IMPL pr_crit("%s: not implemented\n", __func__)
 #define TRACE(fmt, ...) pr_info("%s: " fmt "\n", __func__, ##__VA_ARGS__)
+#define NOT_IMPL TRACE("not implemented")
 
 static irqreturn_t vx_interrupt(int irq, void *opaque)
 {
@@ -101,6 +101,8 @@ static int virtio_xenbus_connect_backend(struct xenbus_device *xb_dev,
 	int ret;
 	int evtchn;
 	struct xenbus_transaction xbt;
+
+	// TODO: clean this fn up
 
 	ret = gnttab_grant_foreign_access(xb_dev->otherend_id,
 					  virt_to_mfn(vx_dev->config_page),
@@ -187,6 +189,8 @@ error_grant:
 	return ret;
 }
 
+// virtio config operations
+
 static void vx_get(struct virtio_device *vdev, unsigned offset,
 		   void *buf, unsigned len)
 {
@@ -263,18 +267,23 @@ static int xen_virtio_probe(struct xenbus_device *xb_dev,
 	int ret;
 	struct virtio_xenbus_device *vx_dev;
 
+	TRACE("enter");
+
 	vx_dev = kzalloc(sizeof(*vx_dev), GFP_KERNEL);
 	if (!vx_dev)
 		return -ENOMEM;
+	TRACE("kzalloc ok");
 
 	vx_dev->vio_dev.dev.parent = &xb_dev->dev;
 	vx_dev->vio_dev.dev.release = virtio_xenbus_release_dev;
 	vx_dev->vio_dev.config = &virtio_xenbus_config_ops;
 
 	if (0 != strncmp(xb_dev->devicetype, "virtio-fs", 9)) {
+		TRACE("error: devicetype: %s", xb_dev->devicetype);
 		ret = -ENODEV;
 		goto err_vxdev;
 	}
+	TRACE("devicetype virtio-fs");
 
 	vx_dev->vio_dev.id.vendor = VIRTIO_DEV_ANY_ID;
 	vx_dev->vio_dev.id.device = VIRTIO_ID_FS;
@@ -299,11 +308,13 @@ static int xen_virtio_probe(struct xenbus_device *xb_dev,
 		ret = -ENOMEM;
 		goto err_drvdata;
 	}
+	TRACE("alloc config_page");
 
 	ret = virtio_xenbus_connect_backend(xb_dev, vx_dev);
 	if (ret < 0)
 		goto err_conf;
 
+	TRACE("return ok");
 	return 0;
 
 err_conf:
