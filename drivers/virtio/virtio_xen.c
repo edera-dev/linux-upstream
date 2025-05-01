@@ -189,6 +189,29 @@ error_grant:
 	return ret;
 }
 
+
+static void virtio_xenbus_disconnect_backend(struct virtio_xenbus_device
+					     *vx_dev)
+{
+	if (vx_dev->notify_irq >= 0)
+		unbind_from_irqhandler(vx_dev->notify_irq, vx_dev);
+	vx_dev->notify_irq = -1;
+
+	if (vx_dev->conf_irq >= 0)
+		unbind_from_irqhandler(vx_dev->conf_irq, vx_dev);
+	vx_dev->conf_irq = -1;
+
+	if (vx_dev->conf_gntref >= 0)
+		gnttab_end_foreign_access_ref(vx_dev->conf_gntref);
+	vx_dev->conf_gntref = -1;
+
+	xenbus_free_evtchn(vx_dev->xb_dev, vx_dev->notify_evtchn);
+	xenbus_free_evtchn(vx_dev->xb_dev, vx_dev->conf_evtchn);
+
+	vx_dev->notify_evtchn = -1;
+	vx_dev->conf_evtchn = -1;
+}
+
 // virtio config operations
 
 static void vx_get(struct virtio_device *vdev, unsigned offset,
@@ -354,9 +377,16 @@ static void xen_virtio_remove(struct xenbus_device *dev)
  * 7. XenbusStateClosed
  *	two halves have disconnected
  */
-static void xen_virtio_changed(struct xenbus_device *dev,
+static void xen_virtio_changed(struct xenbus_device *xb_dev,
 				   enum xenbus_state backend_state)
 {
+	int err;
+
+	// FIXME: figure out correct sequence for state change
+
+	pr_info("xen-virtio: be=%u\n", backend_state);
+	struct virtio_xenbus_device *vxb_dev = dev_get_drvdata(&xb_dev->dev);
+
 	switch (backend_state) {
 	case XenbusStateReconfiguring:
 	case XenbusStateReconfigured:
@@ -367,7 +397,8 @@ static void xen_virtio_changed(struct xenbus_device *dev,
 		break;
 
 	case XenbusStateInitWait:
-		/*  */
+		pr_info("xen-virtio: -> fe=%u\n", XenbusStateConnected);
+		//xenbus_switch_state(xb_dev, XenbusStateInitialised);
 		break;
 
 	case XenbusStateInitialised:
@@ -375,15 +406,29 @@ static void xen_virtio_changed(struct xenbus_device *dev,
 
 	case XenbusStateConnected:
 		/* switch our state to connected? */
+		pr_info("xen-virtio: -> fe=%u (registering virtio)\n", XenbusStateConnected);
+		err = register_virtio_device(&vxb_dev->vio_dev);
+		if (err != 0)
+			pr_err("register_virtio_device returned %d", err);
+		xenbus_switch_state(xb_dev, XenbusStateConnected);
 		break;
 
 	case XenbusStateClosing:
+		pr_info("xen-virtio: -> fe=%u (disconnecting virtio)\n", XenbusStateClosed);
+		xenbus_switch_state(xb_dev, XenbusStateClosing);
+		virtio_xenbus_disconnect_backend(vxb_dev);
+		unregister_virtio_device(&vxb_dev->vio_dev);
+		break;
+
 	case XenbusStateClosed:
+		pr_info("xen-virtio: -> fe=%u\n", XenbusStateClosed);
+		xenbus_switch_state(xb_dev, XenbusStateClosed);
 		break;
 	}
 }
 
 static struct xenbus_driver front_driver = {
+	//.name = "virtio-xenbus-front", // TODO: what to do with this
 	.ids = xen_virtio_ids,
 	.probe = xen_virtio_probe,
 	.remove = xen_virtio_remove,
