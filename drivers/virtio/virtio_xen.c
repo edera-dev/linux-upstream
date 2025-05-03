@@ -8,9 +8,13 @@
 
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/spinlock.h>
+#include <linux/time.h>
+#include <linux/timekeeping.h>
 #include <linux/virtio.h>
-#include <linux/virtio_fs.h>
 #include <linux/virtio_config.h>
+#include <linux/virtio_fs.h>
+#include <linux/virtio_ids.h>
 #include <linux/virtio_ring.h>
 
 #include <xen/events.h>
@@ -23,6 +27,14 @@ MODULE_AUTHOR("Edera");
 MODULE_LICENSE("GPL");
 
 static const struct xenbus_device_id xen_virtio_ids[] = { { "virtio-fs" }, { "" } };
+
+struct virtio_config_page {
+	u8  config[256];
+	int write;
+	int size;
+	int offset;
+	int be_active; /* backend is active */
+};
 
 struct virtio_xenbus_device {
 	struct virtio_device vio_dev;
@@ -61,7 +73,7 @@ static void virtio_xenbus_release_dev(struct device *_d)
 
 static irqreturn_t vx_interrupt(int irq, void *opaque)
 {
-	TRACE("enter");
+	NOT_IMPL;
 	return IRQ_HANDLED;
 
 #if 0 // FIXME:
@@ -214,6 +226,104 @@ static void virtio_xenbus_disconnect_backend(struct virtio_xenbus_device
 
 // virtio config operations
 
+/* A 32-bit r/o bitmask of the features supported by the host */
+#define VIRTIO_XENBUS_HOST_FEATURES        0
+
+/* A 32-bit r/w bitmask of features activated by the guest */
+#define VIRTIO_XENBUS_GUEST_FEATURES       4
+
+/* A 32-bit r/w PFN for the currently selected queue */
+#define VIRTIO_XENBUS_QUEUE_PFN            8
+
+/* A 16-bit r/o queue size for the currently selected queue */
+#define VIRTIO_XENBUS_QUEUE_NUM            12
+
+/* A 16-bit r/w queue selector */
+#define VIRTIO_XENBUS_QUEUE_SEL            14
+
+/* A 16-bit r/w queue notifier */
+#define VIRTIO_XENBUS_QUEUE_NOTIFY         16
+
+/* An 8-bit device status register.  */
+#define VIRTIO_XENBUS_STATUS               18
+
+/* An 8-bit r/o interrupt status register.  Reading the value will return the
+ * current contents of the ISR and will also clear it.  This is effectively
+ * a read-and-acknowledge. */
+#define VIRTIO_XENBUS_ISR                  19
+
+/* The bit of the ISR which indicates a device configuration change. */
+#define VIRTIO_XENBUS_ISR_CONFIG           0x2
+
+/* The remaining space is defined by each driver as the per-driver
+ * configuration space */
+#define VIRTIO_XENBUS_CONFIG(dev)          20
+
+/* Virtio Xenbus ABI version, this must match exactly */
+#define VIRTIO_XENBUS_ABI_VERSION          0
+
+/* How many bits to shift physical queue address written to QUEUE_PFN.
+ * 12 is historical, and due to x86 page size. */
+#define VIRTIO_XENBUS_QUEUE_ADDR_SHIFT     12
+
+/* The alignment to use between consumer and producer parts of vring.
+ * x86 pagesize. */
+#define VIRTIO_XENBUS_VRING_ALIGN          4096
+
+void __vx_wait(struct virtio_xenbus_device *);
+void vx_write8(struct virtio_xenbus_device *, int, int);
+
+void __vx_wait(struct virtio_xenbus_device *vx_dev)
+{
+	evtchn_port_t evtchn = vx_dev->conf_evtchn;
+	unsigned irq = vx_dev->conf_irq;
+
+	struct virtio_config_page *page = vx_dev->config_page;
+
+	// s64 ns, ns_timeout;
+	u64 ns, ns_timeout;
+
+	unsigned long irq_flags;
+	spin_lock_irqsave(&vx_dev->irq_lock, irq_flags);
+	page->be_active = 1;
+
+	mb();
+
+	ns_timeout = ktime_get_real_ns() + 2 * (s64)NSEC_PER_SEC;
+
+	notify_remote_via_evtchn(evtchn);
+	xen_clear_irq_pending(irq);
+
+	while (page->be_active) {
+		xen_poll_irq_timeout(irq, jiffies + 3 * HZ);
+		xen_clear_irq_pending(irq);
+
+		ns = ktime_get_real_ns();
+		if (ns > ns_timeout) {
+			dev_err(&vx_dev->xb_dev->dev,
+				"__vx_wait: virtio back not responding!!!\n");
+			page->be_active = 0;
+			goto out;
+		}
+	}
+out:
+	mb();
+	spin_unlock_irqrestore(&vx_dev->irq_lock, irq_flags);
+}
+
+void vx_write8(struct virtio_xenbus_device *vx_dev, int value, int offset)
+{
+	vx_dev->config_page->write = 1;
+	vx_dev->config_page->offset = offset;
+	vx_dev->config_page->size = 1;
+
+	void *addr = &vx_dev->config_page->config[0] + offset;
+	writeb(value, addr);
+
+	/* We have wmb() in __vx_wait, no need for another one here. */
+	__vx_wait(vx_dev);
+}
+
 static void vx_get(struct virtio_device *vdev, unsigned offset,
 		   void *buf, unsigned len)
 {
@@ -239,7 +349,8 @@ static void vx_set_status(struct virtio_device *vdev, u8 status)
 
 static void vx_reset(struct virtio_device *vdev)
 {
-	NOT_IMPL;
+	struct virtio_xenbus_device *vx_dev = to_vx_device(vdev);
+	vx_write8(vx_dev, 0, VIRTIO_XENBUS_STATUS);
 }
 
 static int vx_find_vqs(struct virtio_device *vdev, unsigned int nvqs,
