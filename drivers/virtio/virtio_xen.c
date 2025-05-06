@@ -28,12 +28,13 @@ MODULE_LICENSE("GPL");
 
 static const struct xenbus_device_id xen_virtio_ids[] = { { "virtio-fs" }, { "" } };
 
+// NOTE: must match backend definition
 struct virtio_config_page {
 	u8  config[256];
-	int write;
-	int size;
-	int offset;
-	int be_active; /* backend is active */
+	u32 write; /* TODO: are these three useful? */
+	u32 size;
+	u32 offset;
+	u32 be_active; /* backend is active */
 };
 
 struct virtio_xenbus_device {
@@ -101,7 +102,7 @@ static irqreturn_t vx_interrupt(int irq, void *opaque)
 
 static irqreturn_t vx_conf_handler(int irq, void *data)
 {
-	TRACE("enter");
+	NOT_IMPL;
 	return IRQ_HANDLED;
 }
 
@@ -116,13 +117,18 @@ static int virtio_xenbus_connect_backend(struct xenbus_device *xb_dev,
 
 	// TODO: clean this fn up
 
+	// export configuration page to grant table
+
 	ret = gnttab_grant_foreign_access(xb_dev->otherend_id,
 					  virt_to_mfn(vx_dev->config_page),
-					  0 /* W */);
+					  0 /* RW */);
 	if (ret < 0)
 		return ret;
 	vx_dev->conf_gntref = ret;
 	TRACE("conf_gntref = %d", ret);
+
+	// create notification channel for virtqueues
+	// and bind to handler
 
 	ret = xenbus_alloc_evtchn(xb_dev, &evtchn);
 	if (ret)
@@ -136,6 +142,9 @@ static int virtio_xenbus_connect_backend(struct xenbus_device *xb_dev,
 		goto error_notify_evtchn;
 	vx_dev->notify_irq = ret;
 	TRACE("notify_irq = %d", ret);
+
+	// create notification channel for the config page
+	// and bind to handler
 
 	ret = xenbus_alloc_evtchn(xb_dev, &evtchn);
 	if (ret)
@@ -275,23 +284,22 @@ void vx_write8(struct virtio_xenbus_device *, int, int);
 
 void __vx_wait(struct virtio_xenbus_device *vx_dev)
 {
-	evtchn_port_t evtchn = vx_dev->conf_evtchn;
+	struct virtio_config_page *page = vx_dev->config_page;
 	unsigned irq = vx_dev->conf_irq;
 
-	struct virtio_config_page *page = vx_dev->config_page;
-
-	// s64 ns, ns_timeout;
-	u64 ns, ns_timeout;
+	s64 ns, ns_timeout;
 
 	unsigned long irq_flags;
 	spin_lock_irqsave(&vx_dev->irq_lock, irq_flags);
 	page->be_active = 1;
 
+	pr_info("__vx_wait: notifying backend on conf evtchn\n");
+
 	mb();
 
 	ns_timeout = ktime_get_real_ns() + 2 * (s64)NSEC_PER_SEC;
 
-	notify_remote_via_evtchn(evtchn);
+	notify_remote_via_evtchn(vx_dev->conf_evtchn);
 	xen_clear_irq_pending(irq);
 
 	while (page->be_active) {
@@ -301,7 +309,7 @@ void __vx_wait(struct virtio_xenbus_device *vx_dev)
 		ns = ktime_get_real_ns();
 		if (ns > ns_timeout) {
 			dev_err(&vx_dev->xb_dev->dev,
-				"__vx_wait: virtio back not responding!!!\n");
+				"no response from backend\n");
 			page->be_active = 0;
 			goto out;
 		}
@@ -347,10 +355,11 @@ static void vx_set_status(struct virtio_device *vdev, u8 status)
 	NOT_IMPL;
 }
 
+// NOTE: this is the first fn invoked by the virtio subsystem
 static void vx_reset(struct virtio_device *vdev)
 {
-	struct virtio_xenbus_device *vx_dev = to_vx_device(vdev);
-	vx_write8(vx_dev, 0, VIRTIO_XENBUS_STATUS);
+	pr_info("vx_reset: writing 0 to offset %u", VIRTIO_XENBUS_STATUS);
+	vx_write8(to_vx_device(vdev), 0, VIRTIO_XENBUS_STATUS);
 }
 
 static int vx_find_vqs(struct virtio_device *vdev, unsigned int nvqs,
