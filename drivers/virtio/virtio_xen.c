@@ -281,6 +281,7 @@ static void virtio_xenbus_disconnect_backend(struct virtio_xenbus_device
 
 void __vx_wait(struct virtio_xenbus_device *);
 void vx_write8(struct virtio_xenbus_device *, int, int);
+u8 vx_read8(struct virtio_xenbus_device *, int);
 
 void __vx_wait(struct virtio_xenbus_device *vx_dev)
 {
@@ -291,18 +292,17 @@ void __vx_wait(struct virtio_xenbus_device *vx_dev)
 
 	unsigned long irq_flags;
 	spin_lock_irqsave(&vx_dev->irq_lock, irq_flags);
-	page->be_active = 1;
 
-	pr_info("__vx_wait: notifying backend on conf evtchn\n");
+	page->be_active = 1;
 
 	mb();
 
-	ns_timeout = ktime_get_real_ns() + 2 * (s64)NSEC_PER_SEC;
+	ns_timeout = ktime_get_real_ns() + (s64)NSEC_PER_SEC / 2;
 
 	notify_remote_via_evtchn(vx_dev->conf_evtchn);
 	xen_clear_irq_pending(irq);
 
-	while (page->be_active) {
+	while (page->be_active) { // toggled by backend
 		xen_poll_irq_timeout(irq, jiffies + 3 * HZ);
 		xen_clear_irq_pending(irq);
 
@@ -321,15 +321,51 @@ out:
 
 void vx_write8(struct virtio_xenbus_device *vx_dev, int value, int offset)
 {
-	vx_dev->config_page->write = 1;
-	vx_dev->config_page->offset = offset;
-	vx_dev->config_page->size = 1;
+	struct virtio_config_page *conf = vx_dev->config_page;
 
-	void *addr = &vx_dev->config_page->config[0] + offset;
+	conf->write = 1;
+	conf->offset = offset;
+	conf->size = 1;
+
+	void *addr = &conf->config[0] + offset;
 	writeb(value, addr);
 
-	/* We have wmb() in __vx_wait, no need for another one here. */
 	__vx_wait(vx_dev);
+}
+
+u8 vx_read8(struct virtio_xenbus_device *vx_dev, int offset)
+{
+	struct virtio_config_page *conf = vx_dev->config_page;
+	void *addr = &conf->config[0] + offset;
+
+	conf->write = 0;
+	conf->offset = offset;
+	conf->size = 1;
+
+	__vx_wait(vx_dev);
+
+	return readb(addr);
+}
+
+static u8 vx_get_status(struct virtio_device *vdev)
+{
+	pr_info("%s: [VIRTIO_XENBUS_STATUS]", __func__);
+	u8 ret = vx_read8(to_vx_device(vdev), VIRTIO_XENBUS_STATUS);
+	pr_info("%s: [VIRTIO_XENBUS_STATUS] -> %d", __func__, ret);
+	return ret;
+}
+
+static void vx_set_status(struct virtio_device *vdev, u8 status)
+{
+	pr_info("%s: [VIRTIO_XENBUS_STATUS] := %u", __func__, status);
+	vx_write8(to_vx_device(vdev), status, VIRTIO_XENBUS_STATUS);
+}
+
+// NOTE: this is the first fn invoked by the virtio subsystem
+static void vx_reset(struct virtio_device *vdev)
+{
+	pr_info("%s", __func__);
+	vx_set_status(vdev, 0);
 }
 
 static void vx_get(struct virtio_device *vdev, unsigned offset,
@@ -342,24 +378,6 @@ static void vx_set(struct virtio_device *vdev, unsigned offset,
 		   const void *buf, unsigned len)
 {
 	NOT_IMPL;
-}
-
-static u8 vx_get_status(struct virtio_device *vdev)
-{
-	NOT_IMPL;
-	return 0xff;
-}
-
-static void vx_set_status(struct virtio_device *vdev, u8 status)
-{
-	NOT_IMPL;
-}
-
-// NOTE: this is the first fn invoked by the virtio subsystem
-static void vx_reset(struct virtio_device *vdev)
-{
-	pr_info("vx_reset: writing 0 to offset %u", VIRTIO_XENBUS_STATUS);
-	vx_write8(to_vx_device(vdev), 0, VIRTIO_XENBUS_STATUS);
 }
 
 static int vx_find_vqs(struct virtio_device *vdev, unsigned int nvqs,
