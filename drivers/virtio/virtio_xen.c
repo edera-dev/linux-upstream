@@ -210,7 +210,6 @@ error_grant:
 	return ret;
 }
 
-
 static void virtio_xenbus_disconnect_backend(struct virtio_xenbus_device
 					     *vx_dev)
 {
@@ -235,38 +234,36 @@ static void virtio_xenbus_disconnect_backend(struct virtio_xenbus_device
 
 // virtio config operations
 
-/* A 32-bit r/o bitmask of the features supported by the host */
+/* A 64-bit r/o bitmask of the features supported by the host */
 #define VIRTIO_XENBUS_HOST_FEATURES        0
 
-/* A 32-bit r/w bitmask of features activated by the guest */
-#define VIRTIO_XENBUS_GUEST_FEATURES       4
+/* A 64-bit r/w bitmask of features activated by the guest */
+#define VIRTIO_XENBUS_GUEST_FEATURES       8
 
 /* A 32-bit r/w PFN for the currently selected queue */
-#define VIRTIO_XENBUS_QUEUE_PFN            8
+#define VIRTIO_XENBUS_QUEUE_PFN            16
 
 /* A 16-bit r/o queue size for the currently selected queue */
-#define VIRTIO_XENBUS_QUEUE_NUM            12
+#define VIRTIO_XENBUS_QUEUE_NUM            20
 
 /* A 16-bit r/w queue selector */
-#define VIRTIO_XENBUS_QUEUE_SEL            14
+#define VIRTIO_XENBUS_QUEUE_SEL            22
 
 /* A 16-bit r/w queue notifier */
-#define VIRTIO_XENBUS_QUEUE_NOTIFY         16
+#define VIRTIO_XENBUS_QUEUE_NOTIFY         24
 
 /* An 8-bit device status register.  */
-#define VIRTIO_XENBUS_STATUS               18
+#define VIRTIO_XENBUS_STATUS               26
 
 /* An 8-bit r/o interrupt status register.  Reading the value will return the
  * current contents of the ISR and will also clear it.  This is effectively
  * a read-and-acknowledge. */
-#define VIRTIO_XENBUS_ISR                  19
+#define VIRTIO_XENBUS_ISR                  27
 
 /* The bit of the ISR which indicates a device configuration change. */
 #define VIRTIO_XENBUS_ISR_CONFIG           0x2
 
-/* The remaining space is defined by each driver as the per-driver
- * configuration space */
-#define VIRTIO_XENBUS_CONFIG(dev)          20
+#define VIRTIO_XENBUS_CONFIG_OFF           28
 
 /* Virtio Xenbus ABI version, this must match exactly */
 #define VIRTIO_XENBUS_ABI_VERSION          0
@@ -279,9 +276,13 @@ static void virtio_xenbus_disconnect_backend(struct virtio_xenbus_device
  * x86 pagesize. */
 #define VIRTIO_XENBUS_VRING_ALIGN          4096
 
+/* low-level routines to talk with our QEMU backend */
+
 void __vx_wait(struct virtio_xenbus_device *);
 void vx_write8(struct virtio_xenbus_device *, int, int);
 u8 vx_read8(struct virtio_xenbus_device *, int);
+void vx_write64(struct virtio_xenbus_device *, u64, int);
+u64 vx_read64(struct virtio_xenbus_device *, int);
 
 void __vx_wait(struct virtio_xenbus_device *vx_dev)
 {
@@ -333,6 +334,22 @@ void vx_write8(struct virtio_xenbus_device *vx_dev, int value, int offset)
 	__vx_wait(vx_dev);
 }
 
+void vx_write64(struct virtio_xenbus_device *vx_dev, u64 value, int offset)
+{
+	struct virtio_config_page *conf = vx_dev->config_page;
+
+	// TODO: any issues writing 8b? atomicity
+
+	conf->write = 1;
+	conf->offset = offset;
+	conf->size = 8;
+
+	void *addr = &conf->config[0] + offset;
+	writeq(value, addr);
+
+	__vx_wait(vx_dev);
+}
+
 u8 vx_read8(struct virtio_xenbus_device *vx_dev, int offset)
 {
 	struct virtio_config_page *conf = vx_dev->config_page;
@@ -347,17 +364,32 @@ u8 vx_read8(struct virtio_xenbus_device *vx_dev, int offset)
 	return readb(addr);
 }
 
+u64 vx_read64(struct virtio_xenbus_device *vx_dev, int offset)
+{
+	struct virtio_config_page *conf = vx_dev->config_page;
+	void *addr = &conf->config[0] + offset;
+
+	conf->write = 0;
+	conf->offset = offset;
+	conf->size = 8;
+
+	__vx_wait(vx_dev);
+
+	return readq(addr);
+}
+
+/* virtio callback fns invoked from our frontend */
+
 static u8 vx_get_status(struct virtio_device *vdev)
 {
-	pr_info("%s: [VIRTIO_XENBUS_STATUS]", __func__);
 	u8 ret = vx_read8(to_vx_device(vdev), VIRTIO_XENBUS_STATUS);
-	pr_info("%s: [VIRTIO_XENBUS_STATUS] -> %d", __func__, ret);
+	pr_info("%s: %#x", __func__, ret);
 	return ret;
 }
 
 static void vx_set_status(struct virtio_device *vdev, u8 status)
 {
-	pr_info("%s: [VIRTIO_XENBUS_STATUS] := %u", __func__, status);
+	pr_info("%s: %#x", __func__, status);
 	vx_write8(to_vx_device(vdev), status, VIRTIO_XENBUS_STATUS);
 }
 
@@ -396,14 +428,17 @@ static void vx_del_vqs(struct virtio_device *vdev)
 
 static u64 vx_get_features(struct virtio_device *vdev)
 {
-	NOT_IMPL;
-	return 0u;
+	u64 ret = vx_read64(to_vx_device(vdev), VIRTIO_XENBUS_HOST_FEATURES);
+	pr_info("%s: %#llx", __func__, ret);
+	return ret;
 }
 
 static int vx_finalize_features(struct virtio_device *vdev)
 {
-	NOT_IMPL;
-	return -ENODEV;
+	vring_transport_features(vdev);
+	pr_info("%s: %#llx", __func__, vdev->features);
+	vx_write64(to_vx_device(vdev), vdev->features, VIRTIO_XENBUS_GUEST_FEATURES);
+	return 0;
 }
 
 static struct virtio_config_ops virtio_xenbus_config_ops = {
