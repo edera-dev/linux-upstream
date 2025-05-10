@@ -400,16 +400,26 @@ static void vx_reset(struct virtio_device *vdev)
 	vx_set_status(vdev, 0);
 }
 
-static void vx_get(struct virtio_device *vdev, unsigned offset,
+static void vx_get_config(struct virtio_device *vdev, unsigned offset,
 		   void *buf, unsigned len)
 {
-	NOT_IMPL;
+	int offset1 = VIRTIO_XENBUS_CONFIG_OFF + offset;
+	u8 *ptr = buf;
+	int i;
+
+	for (i = 0; i < len; i++)
+		ptr[i] = vx_read8(to_vx_device(vdev), offset1 + i);
 }
 
-static void vx_set(struct virtio_device *vdev, unsigned offset,
+static void vx_set_config(struct virtio_device *vdev, unsigned offset,
 		   const void *buf, unsigned len)
 {
-	NOT_IMPL;
+	int offset1 = VIRTIO_XENBUS_CONFIG_OFF + offset;
+	const u8 *ptr = buf;
+	int i;
+
+	for (i = 0; i < len; i++)
+		vx_write8(to_vx_device(vdev), ptr[i], offset1 + i);
 }
 
 static int vx_find_vqs(struct virtio_device *vdev, unsigned int nvqs,
@@ -442,8 +452,8 @@ static int vx_finalize_features(struct virtio_device *vdev)
 }
 
 static struct virtio_config_ops virtio_xenbus_config_ops = {
-	.get		= vx_get,
-	.set		= vx_set,
+	.get		= vx_get_config,
+	.set		= vx_set_config,
 	.get_status	= vx_get_status,
 	.set_status	= vx_set_status,
 	.reset		= vx_reset,
