@@ -6,6 +6,7 @@
  * TODO: Copyright? Ref to Liu Wei?
  */
 
+#include <linux/dma-mapping.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/spinlock.h>
@@ -37,6 +38,17 @@ struct virtio_config_page {
 	u32 be_active; /* backend is active */
 };
 
+struct virtio_xenbus_vq_info {
+	struct virtqueue *vq;
+	int num_entries;
+
+	dma_addr_t queue_dma;
+	void *queue_va; // TODO: maybe not needed
+	int queue_idx;
+
+	struct list_head node;
+};
+
 struct virtio_xenbus_device {
 	struct virtio_device vio_dev;
 	struct xenbus_device *xb_dev;
@@ -50,7 +62,7 @@ struct virtio_xenbus_device {
 	evtchn_port_t conf_evtchn, notify_evtchn;
 
 	spinlock_t vq_lock;
-	struct list_head virtq;
+	struct list_head vq_list;
 
 	char phys[32];
 };
@@ -84,7 +96,7 @@ static irqreturn_t vx_interrupt(int irq, void *opaque)
 
 	/* reading the ISR has the effect of also clearing it so it's very
 	 * important to save the value. */
-	isr = vxread8(vx_dev, VIRTIO_XENBUS_ISR);
+	isr = vx_read8(vx_dev, VIRTIO_XENBUS_ISR);
 
 	/* It's definitely not us if the ISR was not high */
 	if (!isr)
@@ -276,12 +288,17 @@ static void virtio_xenbus_disconnect_backend(struct virtio_xenbus_device
  * x86 pagesize. */
 #define VIRTIO_XENBUS_VRING_ALIGN          4096
 
-/* low-level routines to talk with our QEMU backend */
+/* read and write callback ops */
 
 void __vx_wait(struct virtio_xenbus_device *);
-void vx_write8(struct virtio_xenbus_device *, int, int);
-u8 vx_read8(struct virtio_xenbus_device *, int);
+void vx_write8(struct virtio_xenbus_device *, u8, int);
+void vx_write16(struct virtio_xenbus_device *, u16, int);
+void vx_write32(struct virtio_xenbus_device *, u32, int);
 void vx_write64(struct virtio_xenbus_device *, u64, int);
+
+u8 vx_read8(struct virtio_xenbus_device *, int);
+u16 vx_read16(struct virtio_xenbus_device *, int);
+u32 vx_read32(struct virtio_xenbus_device *, int);
 u64 vx_read64(struct virtio_xenbus_device *, int);
 
 void __vx_wait(struct virtio_xenbus_device *vx_dev)
@@ -320,7 +337,7 @@ out:
 	spin_unlock_irqrestore(&vx_dev->irq_lock, irq_flags);
 }
 
-void vx_write8(struct virtio_xenbus_device *vx_dev, int value, int offset)
+void vx_write8(struct virtio_xenbus_device *vx_dev, u8 value, int offset)
 {
 	struct virtio_config_page *conf = vx_dev->config_page;
 
@@ -330,6 +347,34 @@ void vx_write8(struct virtio_xenbus_device *vx_dev, int value, int offset)
 
 	void *addr = &conf->config[0] + offset;
 	writeb(value, addr);
+
+	__vx_wait(vx_dev);
+}
+
+void vx_write16(struct virtio_xenbus_device *vx_dev, u16 value, int offset)
+{
+	struct virtio_config_page *conf = vx_dev->config_page;
+
+	conf->write = 1;
+	conf->offset = offset;
+	conf->size = 2;
+
+	void *addr = &conf->config[0] + offset;
+	writew(value, addr);
+
+	__vx_wait(vx_dev);
+}
+
+void vx_write32(struct virtio_xenbus_device *vx_dev, u32 value, int offset)
+{
+	struct virtio_config_page *conf = vx_dev->config_page;
+
+	conf->write = 1;
+	conf->offset = offset;
+	conf->size = 4;
+
+	void *addr = &conf->config[0] + offset;
+	writel(value, addr);
 
 	__vx_wait(vx_dev);
 }
@@ -364,6 +409,34 @@ u8 vx_read8(struct virtio_xenbus_device *vx_dev, int offset)
 	return readb(addr);
 }
 
+u16 vx_read16(struct virtio_xenbus_device *vx_dev, int offset)
+{
+	struct virtio_config_page *conf = vx_dev->config_page;
+	void *addr = &conf->config[0] + offset;
+
+	conf->write = 0;
+	conf->offset = offset;
+	conf->size = 2;
+
+	__vx_wait(vx_dev);
+
+	return readw(addr);
+}
+
+u32 vx_read32(struct virtio_xenbus_device *vx_dev, int offset)
+{
+	struct virtio_config_page *conf = vx_dev->config_page;
+	void *addr = &conf->config[0] + offset;
+
+	conf->write = 0;
+	conf->offset = offset;
+	conf->size = 4;
+
+	__vx_wait(vx_dev);
+
+	return readl(addr);
+}
+
 u64 vx_read64(struct virtio_xenbus_device *vx_dev, int offset)
 {
 	struct virtio_config_page *conf = vx_dev->config_page;
@@ -378,25 +451,179 @@ u64 vx_read64(struct virtio_xenbus_device *vx_dev, int offset)
 	return readq(addr);
 }
 
+/* virtqueue helper routines */
+
+static bool vx_notify(struct virtqueue *vq)
+{
+	struct virtio_xenbus_device *vx_dev = to_vx_device(vq->vdev);
+	struct virtio_xenbus_vq_info *info = vq->priv;
+
+	TRACE("");
+
+	/* we write the queue's selector into the notification register to
+	 * signal the other end */
+	vx_write16(vx_dev, info->queue_idx, VIRTIO_XENBUS_QUEUE_NOTIFY);
+
+	return true; // FIXME: what does return status indicate?
+}
+
+static int vx_read_vq_conf(struct virtio_xenbus_device *vx_dev,
+			   struct virtio_xenbus_vq_info *info,
+			   unsigned index)
+{
+	TRACE("enter");
+
+	vx_write16(vx_dev, index, VIRTIO_XENBUS_QUEUE_SEL);
+
+	u16 num = vx_read16(vx_dev, VIRTIO_XENBUS_QUEUE_NUM);
+
+	if (num == 0)
+		return -ENOENT; /* not available */
+
+	if (vx_read32(vx_dev, VIRTIO_XENBUS_QUEUE_PFN) != 0)
+		return -ENOENT; /* already activated */
+
+	info->queue_idx = index;
+	info->num_entries = num;
+
+	TRACE("exit");
+	return 0;
+}
+
+// FIXME: what is ctx indicating? do we have to act on it?
+static struct virtqueue *vx_setup_vq(struct virtio_device *vd, unsigned index,
+				  void (*callback)(struct virtqueue *vq),
+				  const char *name, bool ctx)
+{
+	struct virtio_xenbus_device *vx_dev = to_vx_device(vd);
+	struct virtio_xenbus_vq_info *info;
+	struct virtqueue *vq;
+	unsigned long flags;
+	//unsigned long size;
+	int err;
+
+	TRACE("enter");
+
+	info = kmalloc(sizeof(struct virtio_xenbus_vq_info), GFP_KERNEL);
+	if (!info)
+		return ERR_PTR(-ENOMEM);
+
+	err = vx_read_vq_conf(vx_dev, info, index);
+	if (err < 0)
+		goto out_info;
+	TRACE("conf ok");
+
+	/* NOTE: (lw) the shared queue MUST be machine contiguous */
+	//size = PAGE_ALIGN(vring_size(info->num_entries, VIRTIO_XENBUS_VRING_ALIGN));
+	//info->queue_va = dma_alloc_coherent(NULL, size,
+	//				    &info->queue_dma,
+	//				    GFP_KERNEL|__GFP_ZERO);
+	//if (info->queue_va == NULL) {
+	//	err = -ENOMEM;
+	//	goto out_info;
+	//}
+
+	/*
+	 * NOTE: 2a2d1382fe9dccfc introduced a new API: vring_create_virtqueue
+	 * The API vring_new_virtqueue is older and left for compatibility.
+
+	 *      has dma quirk = !VIRTIO_F_ACCESS_PLATFORM
+	 *  vring use dma api = !has_quirk || xen_domain
+	 *
+	 * dma_alloc_coherent = vring use dma api
+	 *                    = !has_quirk || xen_domain
+	 *                    = VIRTIO_F_ACCESS_PLATFORM || xen_domain
+	 *
+	 * Seems we do not need to fiddle with this? As long as it is
+	 * a Xen domain, then we should be using the DMA API.
+	 *
+	 * NOTE: if we use vring_create_virtqueue then we need the PFN of the
+	 * underlying DMA buffer to share with the backend...
+	 */
+	bool weak_barriers = true;
+	bool may_reduce = false;
+	TRACE("-> vring_create_virtqueue");
+	vq = vring_create_virtqueue(index, info->num_entries,
+				    VIRTIO_XENBUS_VRING_ALIGN,
+				    vd, weak_barriers, may_reduce,
+				    ctx, vx_notify, callback, name);
+	if (!vq) {
+		err = -ENOMEM;
+		goto out_info;
+	}
+
+	vq->priv = info;
+	info->vq = vq;
+
+	spin_lock_irqsave(&vx_dev->vq_lock, flags);
+	list_add(&info->node, &vx_dev->vq_list);
+	spin_unlock_irqrestore(&vx_dev->vq_lock, flags);
+
+	vx_write32(vx_dev, virtqueue_get_desc_addr(vq) >> PAGE_SHIFT,
+		   VIRTIO_XENBUS_QUEUE_PFN);
+
+	TRACE("exit");
+	return vq;
+
+	//if (vq)
+	//	vring_del_virtqueue(vq);
+	// vx_write32(vx_dev, 0, VIRTIO_XENBUS_QUEUE_PFN);
+	//dma_free_coherent(NULL, size,
+	//		  info->queue_va, info->queue_dma);
+out_info:
+	TRACE("exit (error)");
+	kfree(info);
+	return ERR_PTR(err);
+}
+
+static void vx_del_vq(struct virtqueue *vq)
+{
+	struct virtio_xenbus_device *vxb = to_vx_device(vq->vdev);
+	struct virtio_xenbus_vq_info *info = vq->priv;
+	unsigned long flags, size;
+
+	spin_lock_irqsave(&vxb->vq_lock, flags);
+	list_del(&info->node);
+	spin_unlock_irqrestore(&vxb->vq_lock, flags);
+
+	vx_write16(vxb, info->queue_idx, VIRTIO_XENBUS_QUEUE_SEL);
+
+	vring_del_virtqueue(vq);
+
+	/* Select and deactivate the queue */
+	vx_write32(vxb, 0, VIRTIO_XENBUS_QUEUE_PFN);
+
+	kfree(info);
+}
+
+static void vx_del_vqs(struct virtio_device *vd)
+{
+	struct virtqueue *vq, *n;
+
+	list_for_each_entry_safe(vq, n, &vd->vqs, list) {
+		vx_del_vq(vq);
+	}
+}
+
 /* virtio callback fns invoked from our frontend */
 
 static u8 vx_get_status(struct virtio_device *vdev)
 {
 	u8 ret = vx_read8(to_vx_device(vdev), VIRTIO_XENBUS_STATUS);
-	pr_info("%s: %#x", __func__, ret);
+	TRACE("%#x", ret);
 	return ret;
 }
 
 static void vx_set_status(struct virtio_device *vdev, u8 status)
 {
-	pr_info("%s: %#x", __func__, status);
+	TRACE("%#x", status);
 	vx_write8(to_vx_device(vdev), status, VIRTIO_XENBUS_STATUS);
 }
 
 // NOTE: this is the first fn invoked by the virtio subsystem
 static void vx_reset(struct virtio_device *vdev)
 {
-	pr_info("%s", __func__);
+	TRACE("");
 	vx_set_status(vdev, 0);
 }
 
@@ -422,31 +649,50 @@ static void vx_set_config(struct virtio_device *vdev, unsigned offset,
 		vx_write8(to_vx_device(vdev), ptr[i], offset1 + i);
 }
 
-static int vx_find_vqs(struct virtio_device *vdev, unsigned int nvqs,
+static int vx_find_vqs(struct virtio_device *vd, unsigned int nvqs,
 		       struct virtqueue *vqs[],
 		       struct virtqueue_info vqs_info[],
 		       struct irq_affinity *desc)
 {
-	NOT_IMPL;
-	return -ENODEV;
-}
+	int err;
+	int i, queue_idx = 0;
 
-static void vx_del_vqs(struct virtio_device *vdev)
-{
-	NOT_IMPL;
+	// TODO: finish here, model after ccw
+
+	for (i = 0; i < nvqs; ++i) {
+		struct virtqueue_info *vqi = &vqs_info[i];
+
+		if (!vqi->name) {
+			vqs[i] = NULL;
+			continue;
+		}
+
+		vqs[i] = vx_setup_vq(vd, queue_idx++, vqi->callback,
+				     vqi->name, vqi->ctx);
+		if (IS_ERR(vqs[i])) {
+			err = PTR_ERR(vqs[i]);
+			goto error_find;
+		}
+	}
+
+	return 0;
+
+error_find:
+	vx_del_vqs(vd);
+	return err;
 }
 
 static u64 vx_get_features(struct virtio_device *vdev)
 {
 	u64 ret = vx_read64(to_vx_device(vdev), VIRTIO_XENBUS_HOST_FEATURES);
-	pr_info("%s: %#llx", __func__, ret);
+	TRACE("%#llx", ret);
 	return ret;
 }
 
 static int vx_finalize_features(struct virtio_device *vdev)
 {
 	vring_transport_features(vdev);
-	pr_info("%s: %#llx", __func__, vdev->features);
+	TRACE("%#llx", vdev->features);
 	vx_write64(to_vx_device(vdev), vdev->features, VIRTIO_XENBUS_GUEST_FEATURES);
 	return 0;
 }
@@ -504,7 +750,7 @@ static int xen_virtio_probe(struct xenbus_device *xb_dev,
 	snprintf(vx_dev->phys, sizeof(vx_dev->phys), "xenbus/%s",
 		 xb_dev->nodename);
 
-	INIT_LIST_HEAD(&vx_dev->virtq);
+	INIT_LIST_HEAD(&vx_dev->vq_list);
 	spin_lock_init(&vx_dev->vq_lock);
 
 	spin_lock_init(&vx_dev->irq_lock);
@@ -515,6 +761,16 @@ static int xen_virtio_probe(struct xenbus_device *xb_dev,
 		goto err_drvdata;
 	}
 	TRACE("alloc config_page");
+
+	// FIXME: unsure if this is required
+	// Guest throws a warning in dma_alloc_attrs for
+	//		WARN_ON_ONCE(flag & __GFP_COMP)
+	// Tried enabling the below. Need to investigate further.
+	ret = dma_set_mask_and_coherent(&xb_dev->dev, DMA_BIT_MASK(64));
+	if (ret)
+		ret = dma_set_mask_and_coherent(&xb_dev->dev, DMA_BIT_MASK(32));
+	if (ret)
+		dev_warn(&xb_dev->dev, "Failed to enable 64-bit or 32-bit DMA. Trying to continue, but this might not work.\n");
 
 	ret = virtio_xenbus_connect_backend(xb_dev, vx_dev);
 	if (ret < 0)

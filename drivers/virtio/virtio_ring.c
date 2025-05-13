@@ -310,9 +310,11 @@ static void *vring_alloc_queue(struct virtio_device *vdev, size_t size,
 			       struct device *dma_dev)
 {
 	if (vring_use_dma_api(vdev)) {
+		pr_info("%s: using DMA API\n", __func__);
 		return dma_alloc_coherent(dma_dev, size,
 					  dma_handle, flag);
 	} else {
+		pr_info("%s: NOT using DMA API\n", __func__);
 		void *queue = alloc_pages_exact(PAGE_ALIGN(size), flag);
 
 		if (queue) {
