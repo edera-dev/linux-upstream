@@ -31,11 +31,13 @@ static const struct xenbus_device_id xen_virtio_ids[] = { { "virtio-fs" }, { "" 
 
 // NOTE: must match backend definition
 struct virtio_config_page {
-	u8  config[256];
-	u32 write; /* TODO: are these three useful? */
+	u8 device[48];  /* our virtio_xenbus config message buffer */
+	u8 driver[256]; /* driver-private config space */
+	u32 offset;     /* offset into driver-private config space */
+	u32 cmd_code;
+	u32 write;
 	u32 size;
-	u32 offset;
-	u32 be_active; /* backend is active */
+	u32 be_active; /* backend sync toggle */
 };
 
 struct virtio_xenbus_vq_info {
@@ -44,7 +46,7 @@ struct virtio_xenbus_vq_info {
 
 	dma_addr_t queue_dma;
 	void *queue_va; // TODO: maybe not needed
-	int queue_idx;
+	u64 queue_idx;
 
 	struct list_head node;
 };
@@ -84,6 +86,7 @@ static void virtio_xenbus_release_dev(struct device *_d)
 #define TRACE(fmt, ...) pr_info("%s: " fmt "\n", __func__, ##__VA_ARGS__)
 #define NOT_IMPL TRACE("not implemented")
 
+// upcall from backend
 static irqreturn_t vx_interrupt(int irq, void *opaque)
 {
 	NOT_IMPL;
@@ -276,6 +279,7 @@ static void virtio_xenbus_disconnect_backend(struct virtio_xenbus_device
 #define VIRTIO_XENBUS_ISR_CONFIG           0x2
 
 #define VIRTIO_XENBUS_CONFIG_OFF           28
+#define VX_CMD_CONFIG VIRTIO_XENBUS_CONFIG_OFF
 
 /* Virtio Xenbus ABI version, this must match exactly */
 #define VIRTIO_XENBUS_ABI_VERSION          0
@@ -289,17 +293,6 @@ static void virtio_xenbus_disconnect_backend(struct virtio_xenbus_device
 #define VIRTIO_XENBUS_VRING_ALIGN          4096
 
 /* read and write callback ops */
-
-void __vx_wait(struct virtio_xenbus_device *);
-void vx_write8(struct virtio_xenbus_device *, u8, int);
-void vx_write16(struct virtio_xenbus_device *, u16, int);
-void vx_write32(struct virtio_xenbus_device *, u32, int);
-void vx_write64(struct virtio_xenbus_device *, u64, int);
-
-u8 vx_read8(struct virtio_xenbus_device *, int);
-u16 vx_read16(struct virtio_xenbus_device *, int);
-u32 vx_read32(struct virtio_xenbus_device *, int);
-u64 vx_read64(struct virtio_xenbus_device *, int);
 
 void __vx_wait(struct virtio_xenbus_device *vx_dev)
 {
@@ -337,118 +330,63 @@ out:
 	spin_unlock_irqrestore(&vx_dev->irq_lock, irq_flags);
 }
 
-void vx_write8(struct virtio_xenbus_device *vx_dev, u8 value, int offset)
-{
+#define EMIT_VX_READ(N) \
+	u##N vx_read##N(struct virtio_xenbus_device *, u32); \
+	u##N vx_read##N(struct virtio_xenbus_device *vx_dev, u32 cmd_code) { \
+		struct virtio_config_page *conf = vx_dev->config_page; \
+		conf->size = sizeof(u##N); \
+		conf->cmd_code = cmd_code; \
+		conf->write = 0; \
+		__vx_wait(vx_dev); \
+		return *((u##N *)conf->device); \
+	}
+
+EMIT_VX_READ(8)
+EMIT_VX_READ(16)
+EMIT_VX_READ(32)
+EMIT_VX_READ(64)
+
+
+/* For commands with arbitrary argument sizes. */
+void vx_read(struct virtio_xenbus_device *vx_dev, u32 cmd_code, void *dst, u32 size) {
 	struct virtio_config_page *conf = vx_dev->config_page;
 
-	conf->write = 1;
-	conf->offset = offset;
-	conf->size = 1;
-
-	void *addr = &conf->config[0] + offset;
-	writeb(value, addr);
-
-	__vx_wait(vx_dev);
-}
-
-void vx_write16(struct virtio_xenbus_device *vx_dev, u16 value, int offset)
-{
-	struct virtio_config_page *conf = vx_dev->config_page;
-
-	conf->write = 1;
-	conf->offset = offset;
-	conf->size = 2;
-
-	void *addr = &conf->config[0] + offset;
-	writew(value, addr);
-
-	__vx_wait(vx_dev);
-}
-
-void vx_write32(struct virtio_xenbus_device *vx_dev, u32 value, int offset)
-{
-	struct virtio_config_page *conf = vx_dev->config_page;
-
-	conf->write = 1;
-	conf->offset = offset;
-	conf->size = 4;
-
-	void *addr = &conf->config[0] + offset;
-	writel(value, addr);
-
-	__vx_wait(vx_dev);
-}
-
-void vx_write64(struct virtio_xenbus_device *vx_dev, u64 value, int offset)
-{
-	struct virtio_config_page *conf = vx_dev->config_page;
-
-	// TODO: any issues writing 8b? atomicity
-
-	conf->write = 1;
-	conf->offset = offset;
-	conf->size = 8;
-
-	void *addr = &conf->config[0] + offset;
-	writeq(value, addr);
-
-	__vx_wait(vx_dev);
-}
-
-u8 vx_read8(struct virtio_xenbus_device *vx_dev, int offset)
-{
-	struct virtio_config_page *conf = vx_dev->config_page;
-	void *addr = &conf->config[0] + offset;
-
+	conf->size = size;
+	conf->cmd_code = cmd_code;
 	conf->write = 0;
-	conf->offset = offset;
-	conf->size = 1;
 
 	__vx_wait(vx_dev);
 
-	return readb(addr);
+	memcpy(dst, conf->device, size);
 }
 
-u16 vx_read16(struct virtio_xenbus_device *vx_dev, int offset)
-{
-	struct virtio_config_page *conf = vx_dev->config_page;
-	void *addr = &conf->config[0] + offset;
+#define EMIT_VX_WRITE(N) \
+	void vx_write##N(struct virtio_xenbus_device *, u32, u##N); \
+	void vx_write##N(struct virtio_xenbus_device *vx_dev, u32 cmd_code, u##N val) { \
+		struct virtio_config_page *conf = vx_dev->config_page; \
+		conf->size = sizeof(u##N); \
+		conf->cmd_code = cmd_code; \
+		conf->write = 1; \
+		*((u##N *)conf->device) = val; \
+		__vx_wait(vx_dev); \
+	}
 
-	conf->write = 0;
-	conf->offset = offset;
-	conf->size = 2;
+EMIT_VX_WRITE(8)
+EMIT_VX_WRITE(16)
+EMIT_VX_WRITE(32)
+EMIT_VX_WRITE(64)
+
+/* For commands with arbitrary argument sizes. */
+void vx_write(struct virtio_xenbus_device *vx_dev, u32 cmd_code, void *src, u32 size) {
+	struct virtio_config_page *conf = vx_dev->config_page;
+
+	conf->size = size;
+	conf->cmd_code = cmd_code;
+	conf->write = 1;
+
+	memcpy(conf->device, src, size);
 
 	__vx_wait(vx_dev);
-
-	return readw(addr);
-}
-
-u32 vx_read32(struct virtio_xenbus_device *vx_dev, int offset)
-{
-	struct virtio_config_page *conf = vx_dev->config_page;
-	void *addr = &conf->config[0] + offset;
-
-	conf->write = 0;
-	conf->offset = offset;
-	conf->size = 4;
-
-	__vx_wait(vx_dev);
-
-	return readl(addr);
-}
-
-u64 vx_read64(struct virtio_xenbus_device *vx_dev, int offset)
-{
-	struct virtio_config_page *conf = vx_dev->config_page;
-	void *addr = &conf->config[0] + offset;
-
-	conf->write = 0;
-	conf->offset = offset;
-	conf->size = 8;
-
-	__vx_wait(vx_dev);
-
-	return readq(addr);
 }
 
 /* virtqueue helper routines */
@@ -457,15 +395,16 @@ static bool vx_notify(struct virtqueue *vq)
 {
 	struct virtio_xenbus_device *vx_dev = to_vx_device(vq->vdev);
 	struct virtio_xenbus_vq_info *info = vq->priv;
-
 	TRACE("");
 
-	/* we write the queue's selector into the notification register to
-	 * signal the other end */
-	vx_write16(vx_dev, info->queue_idx, VIRTIO_XENBUS_QUEUE_NOTIFY);
+	// NOTE: we use the conf evtchn for virtqueue notifications
+	vx_write16(vx_dev, VIRTIO_XENBUS_QUEUE_NOTIFY, info->queue_idx);
 
-	return true; // FIXME: what does return status indicate?
+	return true;
 }
+
+struct pfn_desc { u64 desc; u64 avail; u64 used; };
+typedef struct pfn_desc pfn_desc;
 
 static int vx_read_vq_conf(struct virtio_xenbus_device *vx_dev,
 			   struct virtio_xenbus_vq_info *info,
@@ -473,15 +412,22 @@ static int vx_read_vq_conf(struct virtio_xenbus_device *vx_dev,
 {
 	TRACE("enter");
 
-	vx_write16(vx_dev, index, VIRTIO_XENBUS_QUEUE_SEL);
+	vx_write16(vx_dev, VIRTIO_XENBUS_QUEUE_SEL, index);
 
 	u16 num = vx_read16(vx_dev, VIRTIO_XENBUS_QUEUE_NUM);
 
-	if (num == 0)
+	if (num == 0) {
+		pr_err("queue is unavailable");
 		return -ENOENT; /* not available */
+	}
 
-	if (vx_read32(vx_dev, VIRTIO_XENBUS_QUEUE_PFN) != 0)
+	pfn_desc desc;
+	vx_read(vx_dev, VIRTIO_XENBUS_QUEUE_PFN, &desc, sizeof(desc));
+	if (desc.desc | desc.avail | desc.used) {
+		pr_err("queue is already activated desc %#lx avail %#lx used %#lx",
+			desc.desc, desc.avail, desc.used);
 		return -ENOENT; /* already activated */
+	}
 
 	info->queue_idx = index;
 	info->num_entries = num;
@@ -559,8 +505,12 @@ static struct virtqueue *vx_setup_vq(struct virtio_device *vd, unsigned index,
 	list_add(&info->node, &vx_dev->vq_list);
 	spin_unlock_irqrestore(&vx_dev->vq_lock, flags);
 
-	vx_write32(vx_dev, virtqueue_get_desc_addr(vq) >> PAGE_SHIFT,
-		   VIRTIO_XENBUS_QUEUE_PFN);
+	pfn_desc desc;
+	desc.desc = virtqueue_get_desc_addr(vq);
+	desc.avail = virtqueue_get_avail_addr(vq);
+	desc.used = virtqueue_get_used_addr(vq);
+	vx_write(vx_dev, VIRTIO_XENBUS_QUEUE_PFN,
+		 &desc, sizeof(desc));
 
 	TRACE("exit");
 	return vq;
@@ -581,17 +531,18 @@ static void vx_del_vq(struct virtqueue *vq)
 	struct virtio_xenbus_device *vxb = to_vx_device(vq->vdev);
 	struct virtio_xenbus_vq_info *info = vq->priv;
 	unsigned long flags, size;
+	TRACE("");
 
 	spin_lock_irqsave(&vxb->vq_lock, flags);
 	list_del(&info->node);
 	spin_unlock_irqrestore(&vxb->vq_lock, flags);
 
-	vx_write16(vxb, info->queue_idx, VIRTIO_XENBUS_QUEUE_SEL);
+	vx_write16(vxb, VIRTIO_XENBUS_QUEUE_SEL, info->queue_idx);
 
 	vring_del_virtqueue(vq);
 
 	/* Select and deactivate the queue */
-	vx_write32(vxb, 0, VIRTIO_XENBUS_QUEUE_PFN);
+	vx_write32(vxb, VIRTIO_XENBUS_QUEUE_PFN, 0);
 
 	kfree(info);
 }
@@ -599,6 +550,7 @@ static void vx_del_vq(struct virtqueue *vq)
 static void vx_del_vqs(struct virtio_device *vd)
 {
 	struct virtqueue *vq, *n;
+	TRACE("");
 
 	list_for_each_entry_safe(vq, n, &vd->vqs, list) {
 		vx_del_vq(vq);
@@ -611,13 +563,13 @@ static u8 vx_get_status(struct virtio_device *vdev)
 {
 	u8 ret = vx_read8(to_vx_device(vdev), VIRTIO_XENBUS_STATUS);
 	TRACE("%#x", ret);
-	return ret;
+	return (u8)ret;
 }
 
 static void vx_set_status(struct virtio_device *vdev, u8 status)
 {
 	TRACE("%#x", status);
-	vx_write8(to_vx_device(vdev), status, VIRTIO_XENBUS_STATUS);
+	vx_write8(to_vx_device(vdev), VIRTIO_XENBUS_STATUS, status);
 }
 
 // NOTE: this is the first fn invoked by the virtio subsystem
@@ -628,25 +580,33 @@ static void vx_reset(struct virtio_device *vdev)
 }
 
 static void vx_get_config(struct virtio_device *vdev, unsigned offset,
-		   void *buf, unsigned len)
+			  void *buf, unsigned len)
 {
-	int offset1 = VIRTIO_XENBUS_CONFIG_OFF + offset;
-	u8 *ptr = buf;
-	int i;
+	struct virtio_config_page *conf = to_vx_device(vdev)->config_page;
 
-	for (i = 0; i < len; i++)
-		ptr[i] = vx_read8(to_vx_device(vdev), offset1 + i);
+	conf->cmd_code = VX_CMD_CONFIG;
+	conf->write = 0;
+	conf->size = len;
+	conf->offset = offset;
+
+	__vx_wait(to_vx_device(vdev));
+
+	memcpy(buf, conf->driver + offset, len);
 }
 
 static void vx_set_config(struct virtio_device *vdev, unsigned offset,
-		   const void *buf, unsigned len)
+			  const void *buf, unsigned len)
 {
-	int offset1 = VIRTIO_XENBUS_CONFIG_OFF + offset;
-	const u8 *ptr = buf;
-	int i;
+	struct virtio_config_page *conf = to_vx_device(vdev)->config_page;
 
-	for (i = 0; i < len; i++)
-		vx_write8(to_vx_device(vdev), ptr[i], offset1 + i);
+	conf->cmd_code = VX_CMD_CONFIG;
+	conf->write = 1;
+	conf->size = len;
+	conf->offset = offset;
+
+	memcpy(conf->driver + offset, buf, len);
+
+	__vx_wait(to_vx_device(vdev));
 }
 
 static int vx_find_vqs(struct virtio_device *vd, unsigned int nvqs,
@@ -656,6 +616,8 @@ static int vx_find_vqs(struct virtio_device *vd, unsigned int nvqs,
 {
 	int err;
 	int i, queue_idx = 0;
+
+	TRACE("nvqs %u", nvqs);
 
 	// TODO: finish here, model after ccw
 
@@ -693,7 +655,7 @@ static int vx_finalize_features(struct virtio_device *vdev)
 {
 	vring_transport_features(vdev);
 	TRACE("%#llx", vdev->features);
-	vx_write64(to_vx_device(vdev), vdev->features, VIRTIO_XENBUS_GUEST_FEATURES);
+	vx_write64(to_vx_device(vdev), VIRTIO_XENBUS_GUEST_FEATURES, vdev->features);
 	return 0;
 }
 
@@ -791,6 +753,7 @@ err_vxdev:
 /* device is removed from backend */
 static void xen_virtio_remove(struct xenbus_device *dev)
 {
+	NOT_IMPL;
 }
 
 /* backend driver state has changed, we are notified
