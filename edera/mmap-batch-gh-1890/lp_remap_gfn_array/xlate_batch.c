@@ -30,7 +30,7 @@ MODULE_INFO(livepatch, "Y");
 #endif
 #endif /* !IN_KERNEL_BUILD */
 
-#define XLATE_BATCH_SIZE 1
+#define XLATE_BATCH_SIZE 16
 
 #ifdef IN_KERNEL_BUILD
 struct xlate_setup {
@@ -62,7 +62,7 @@ struct lp_remap_pfn {
 static int lp_remap_pfn_fn(pte_t *ptep, unsigned long addr, void *data)
 {
 	struct lp_remap_pfn *r = data;
-	printk(KERN_INFO "%s addr %#lx", __func__, addr);
+	//printk(KERN_DEBUG "%s addr %#lx", __func__, addr);
 	pte_t pte =
 		pte_mkspecial(pfn_pte(page_to_pfn(r->pages[r->i++]), r->prot));
 	set_pte_at(r->mm, addr, ptep, pte);
@@ -82,7 +82,7 @@ static int lp_xen_xlate_remap_gfn_array(struct vm_area_struct *vma,
 					int nr, int *err_ptr, pgprot_t prot,
 					unsigned domid, struct page **pages)
 {
-	printk(KERN_INFO "%s", __func__);
+	//printk(KERN_DEBUG "%s", __func__);
 
 	/*
          * 1. Build h_idxs[] (foreign GFNs from gfn[]) and h_gpfns[] (dom0 GFNs from pages[] via page_to_xen_pfn)
@@ -94,9 +94,13 @@ static int lp_xen_xlate_remap_gfn_array(struct vm_area_struct *vma,
 
 	/* Source GFNs in foreign domain P2M (combined with XENMAPSPACE_gmfn_foreign) */
 	xen_ulong_t h_idxs[XLATE_BATCH_SIZE];
+	//xen_ulong_t *h_idxs = kmalloc_array(XLATE_BATCH_SIZE,
+	//sizeof(xen_ulong_t), GFP_KERNEL);
 
 	/* Destination GFNs in dom0's P2M. Extracted from pages[] */
 	xen_pfn_t h_gpfns[XLATE_BATCH_SIZE];
+	//xen_ulong_t *h_gpfns = kmalloc_array(XLATE_BATCH_SIZE,
+	//sizeof(xen_ulong_t), GFP_KERNEL);
 
 	/* h_idxs and h_gpfns exist as pairs: we map into dom0's GFN the same MFN for the GFN in foreign domain. */
 
@@ -104,23 +108,24 @@ static int lp_xen_xlate_remap_gfn_array(struct vm_area_struct *vma,
 	int mapped = 0;
 	int gfn_off = 0; /* index into gfn/err */
 	int page_off = 0; /* index into pages */
+	int hcalls = 0;
 
 	BUILD_BUG_ON(XLATE_BATCH_SIZE % XEN_PFN_PER_PAGE != 0);
 	BUG_ON(!((vma->vm_flags & (VM_PFNMAP | VM_IO)) == (VM_PFNMAP | VM_IO)));
 
-	printk(KERN_INFO "%s: nr %d", __func__, nr);
+	//printk(KERN_DEBUG "%s: nr %d", __func__, nr);
 
 	while (nr > 0) {
 		int batch = min(XLATE_BATCH_SIZE, nr);
-		printk(KERN_INFO "%s: batch %d", __func__, batch);
+		//printk(KERN_DEBUG "%s: batch %d", __func__, batch);
 
 		/* arm: page size may be larger than xen */
 		int batch_pages = DIV_ROUND_UP(batch, XEN_PFN_PER_PAGE);
-		printk(KERN_INFO "%s: batch_pages %d", __func__, batch);
+		//printk(KERN_DEBUG "%s: batch_pages %d", __func__, batch);
 
 		unsigned long batch_range = (unsigned long)batch_pages
 					    << PAGE_SHIFT;
-		printk(KERN_INFO "%s: batch_range %lu", __func__, batch_range);
+		//printk(KERN_DEBUG "%s: batch_range %lu", __func__, batch_range);
 		unsigned int start_extent = 0;
 
 		int rc, i;
@@ -143,12 +148,12 @@ static int lp_xen_xlate_remap_gfn_array(struct vm_area_struct *vma,
 
 		/* for each _source_ page in the batch (arm: pages may be larger than 4Ki) */
 		for (i = 0; i < batch; i++) {
-			/* dom0 struct page -> xen PFN -> GFN */
+			/* dom0 struct page -> xen PFN -> GFN (arm: hits once per larger guest page) */
 			if ((i % XEN_PFN_PER_PAGE) == 0) {
 				xen_pfn = page_to_xen_pfn(
 					pages[page_off + i / XEN_PFN_PER_PAGE]);
-				printk(KERN_INFO "%s: i %d xen_pfn %#lx",
-				       __func__, i, xen_pfn);
+				//printk(KERN_DEBUG "%s: i %d xen_pfn %#lx",
+				//__func__, i, xen_pfn);
 			}
 			h_idxs[i] = gfn[gfn_off + i];
 			h_gpfns[i] = pfn_to_gfn(xen_pfn++);
@@ -172,14 +177,13 @@ static int lp_xen_xlate_remap_gfn_array(struct vm_area_struct *vma,
 				XENMEM_add_to_physmap_range |
 					(start_extent << MEMOP_EXTENT_SHIFT),
 				&xatp);
-			printk(KERN_INFO
-			       "%s: XENMEM_add_to_physmap_range rc %d",
-			       __func__, rc);
+			//printk(KERN_DEBUG "%s: XENMEM_add_to_physmap_range rc %d", __func__, rc);
+			hcalls++;
 			if (rc > 0)
 				start_extent = rc;
 		} while (rc > 0);
 
-		printk(KERN_INFO "%s: P2M done", __func__);
+		//printk(KERN_DEBUG "%s: P2M done", __func__);
 
 		struct lp_remap_pfn r = {
 			.mm = vma->vm_mm,
@@ -190,7 +194,7 @@ static int lp_xen_xlate_remap_gfn_array(struct vm_area_struct *vma,
 		apply_to_page_range(vma->vm_mm, addr, batch_range,
 				    lp_remap_pfn_fn, &r);
 
-		printk(KERN_INFO "%s: PT done", __func__);
+		//printk(KERN_DEBUG "%s: PT done", __func__);
 
 		for (i = 0; i < batch; i++) {
 			int err = (rc < 0) ? rc : h_errs[i];
@@ -206,7 +210,9 @@ static int lp_xen_xlate_remap_gfn_array(struct vm_area_struct *vma,
 		cond_resched();
 	}
 
-	printk(KERN_INFO "%s: mapped %d", __func__, mapped);
+	printk(KERN_INFO "%s: mapped %d hcalls %d", __func__, mapped, hcalls);
+	//kfree(h_idxs);
+	//kfree(h_gpfns);
 	return mapped;
 }
 

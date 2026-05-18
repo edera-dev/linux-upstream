@@ -13,5 +13,5 @@ load:
 	sudo insmod xlate_batch.ko
 unload:
 	echo 0 | sudo tee /sys/kernel/livepatch/xlate_batch/enabled
-	sleep 1
+	sleep 2
 	sudo rmmod xlate_batch
