@@ -2,6 +2,8 @@
 #include <linux/kernel.h>
 #include <linux/livepatch.h>
 #include <linux/mm.h>
+#include <linux/debugfs.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/pgtable.h>
 #include <linux/sched.h>
@@ -18,6 +20,29 @@
 
 MODULE_LICENSE("GPL");
 MODULE_INFO(livepatch, "Y");
+
+static struct dentry *dfs_dir;
+static atomic64_t stat_total_ns = ATOMIC64_INIT(0);
+static atomic64_t stat_p2m_ns = ATOMIC64_INIT(0);
+static atomic64_t stat_pt_ns = ATOMIC64_INIT(0);
+
+static int stats_show(struct seq_file *m, void *v)
+{
+	u64 total_ns = atomic64_read(&stat_total_ns);
+	u64 p2m_ns = atomic64_read(&stat_p2m_ns);
+	u64 pt_ns = atomic64_read(&stat_pt_ns);
+
+	seq_printf(m, "total_ms: %llu\n", total_ns / 1000 / 1000);
+	seq_printf(m, "p2m_ms:   %llu\n", p2m_ns / 1000 / 1000);
+	seq_printf(m, "pt_ms:    %llu\n", pt_ns / 1000 / 1000);
+
+	atomic64_set(&stat_total_ns, 0);
+	atomic64_set(&stat_p2m_ns, 0);
+	atomic64_set(&stat_pt_ns, 0);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(stats);
 
 #ifndef IN_KERNEL_BUILD
 /*
@@ -83,6 +108,8 @@ static int lp_xen_xlate_remap_gfn_array(struct vm_area_struct *vma,
 					unsigned domid, struct page **pages)
 {
 	//printk(KERN_DEBUG "%s", __func__);
+
+	ktime_t stat_start = ktime_get();
 
 	/*
          * 1. Build h_idxs[] (foreign GFNs from gfn[]) and h_gpfns[] (dom0 GFNs from pages[] via page_to_xen_pfn)
@@ -172,6 +199,7 @@ static int lp_xen_xlate_remap_gfn_array(struct vm_area_struct *vma,
 		set_xen_guest_handle(xatp.gpfns, h_gpfns);
 		set_xen_guest_handle(xatp.errs, h_errs);
 
+		ktime_t marker = ktime_get();
 		do {
 			rc = HYPERVISOR_memory_op(
 				XENMEM_add_to_physmap_range |
@@ -182,9 +210,12 @@ static int lp_xen_xlate_remap_gfn_array(struct vm_area_struct *vma,
 			if (rc > 0)
 				start_extent = rc;
 		} while (rc > 0);
+		atomic64_add(ktime_to_ns(ktime_sub(ktime_get(), marker)),
+			     &stat_p2m_ns);
 
 		//printk(KERN_DEBUG "%s: P2M done", __func__);
 
+		marker = ktime_get();
 		struct lp_remap_pfn r = {
 			.mm = vma->vm_mm,
 			.pages = &pages[page_off],
@@ -193,6 +224,8 @@ static int lp_xen_xlate_remap_gfn_array(struct vm_area_struct *vma,
 		};
 		apply_to_page_range(vma->vm_mm, addr, batch_range,
 				    lp_remap_pfn_fn, &r);
+		atomic64_add(ktime_to_ns(ktime_sub(ktime_get(), marker)),
+			     &stat_pt_ns);
 
 		//printk(KERN_DEBUG "%s: PT done", __func__);
 
@@ -209,6 +242,11 @@ static int lp_xen_xlate_remap_gfn_array(struct vm_area_struct *vma,
 		nr -= batch;
 		cond_resched();
 	}
+
+	ktime_t stat_end = ktime_get();
+
+	atomic64_add(ktime_to_ns(ktime_sub(stat_end, stat_start)),
+		     &stat_total_ns);
 
 	printk(KERN_INFO "%s: mapped %d hcalls %d", __func__, mapped, hcalls);
 	//kfree(h_idxs);
@@ -236,6 +274,8 @@ static struct klp_patch patch = {
 
 static int lp_init(void)
 {
+	dfs_dir = debugfs_create_dir("xlate", NULL);
+	debugfs_create_file("stats", 0444, dfs_dir, NULL, &stats_fops);
 	return klp_enable_patch(&patch);
 }
 static void lp_exit(void)
