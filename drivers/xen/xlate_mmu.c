@@ -42,7 +42,28 @@
 #include <xen/interface/memory.h>
 #include <xen/balloon.h>
 
+#define XLATE_BATCH_SIZE 16
+
 typedef void (*xen_gfn_fn_t)(unsigned long gfn, void *data);
+
+struct remap_pfn {
+	struct mm_struct *mm;
+	struct page **pages;
+	pgprot_t prot;
+	unsigned long i;
+};
+
+static int remap_pfn_fn(pte_t *ptep, unsigned long addr, void *data)
+{
+	struct remap_pfn *r = data;
+	struct page *page = r->pages[r->i];
+	pte_t pte = pte_mkspecial(pfn_pte(page_to_pfn(page), r->prot));
+
+	set_pte_at(r->mm, addr, ptep, pte);
+	r->i++;
+
+	return 0;
+}
 
 /* Break down the pages in 4KB chunk and call fn for each gfn */
 static void xen_for_each_gfn(struct page **pages, unsigned nr_gfn,
@@ -61,113 +82,97 @@ static void xen_for_each_gfn(struct page **pages, unsigned nr_gfn,
 	}
 }
 
-struct remap_data {
-	xen_pfn_t *fgfn; /* foreign domain's gfn */
-	int nr_fgfn; /* Number of foreign gfn left to map */
-	pgprot_t prot;
-	domid_t  domid;
-	struct vm_area_struct *vma;
-	int index;
-	struct page **pages;
-	struct xen_remap_gfn_info *info;
-	int *err_ptr;
-	int mapped;
-
-	/* Hypercall parameters */
-	int h_errs[XEN_PFN_PER_PAGE];
-	xen_ulong_t h_idxs[XEN_PFN_PER_PAGE];
-	xen_pfn_t h_gpfns[XEN_PFN_PER_PAGE];
-
-	int h_iter;	/* Iterator */
-};
-
-static void setup_hparams(unsigned long gfn, void *data)
-{
-	struct remap_data *info = data;
-
-	info->h_idxs[info->h_iter] = *info->fgfn;
-	info->h_gpfns[info->h_iter] = gfn;
-	info->h_errs[info->h_iter] = 0;
-
-	info->h_iter++;
-	info->fgfn++;
-}
-
-static int remap_pte_fn(pte_t *ptep, unsigned long addr, void *data)
-{
-	struct remap_data *info = data;
-	struct page *page = info->pages[info->index++];
-	pte_t pte = pte_mkspecial(pfn_pte(page_to_pfn(page), info->prot));
-	int rc, nr_gfn;
-	uint32_t i;
-	struct xen_add_to_physmap_range xatp = {
-		.domid = DOMID_SELF,
-		.foreign_domid = info->domid,
-		.space = XENMAPSPACE_gmfn_foreign,
-	};
-
-	nr_gfn = min_t(typeof(info->nr_fgfn), XEN_PFN_PER_PAGE, info->nr_fgfn);
-	info->nr_fgfn -= nr_gfn;
-
-	info->h_iter = 0;
-	xen_for_each_gfn(&page, nr_gfn, setup_hparams, info);
-	BUG_ON(info->h_iter != nr_gfn);
-
-	set_xen_guest_handle(xatp.idxs, info->h_idxs);
-	set_xen_guest_handle(xatp.gpfns, info->h_gpfns);
-	set_xen_guest_handle(xatp.errs, info->h_errs);
-	xatp.size = nr_gfn;
-
-	rc = HYPERVISOR_memory_op(XENMEM_add_to_physmap_range, &xatp);
-
-	/* info->err_ptr expect to have one error status per Xen PFN */
-	for (i = 0; i < nr_gfn; i++) {
-		int err = (rc < 0) ? rc : info->h_errs[i];
-
-		*(info->err_ptr++) = err;
-		if (!err)
-			info->mapped++;
-	}
-
-	/*
-	 * Note: The hypercall will return 0 in most of the case if even if
-	 * all the fgmfn are not mapped. We still have to update the pte
-	 * as the userspace may decide to continue.
-	 */
-	if (!rc)
-		set_pte_at(info->vma->vm_mm, addr, ptep, pte);
-
-	return 0;
-}
-
-int xen_xlate_remap_gfn_array(struct vm_area_struct *vma,
-			      unsigned long addr,
-			      xen_pfn_t *gfn, int nr,
-			      int *err_ptr, pgprot_t prot,
-			      unsigned domid,
+int xen_xlate_remap_gfn_array(struct vm_area_struct *vma, unsigned long addr,
+			      xen_pfn_t *gfn, int nr, int *err_ptr,
+			      pgprot_t prot, unsigned domid,
 			      struct page **pages)
 {
-	int err;
-	struct remap_data data;
-	unsigned long range = DIV_ROUND_UP(nr, XEN_PFN_PER_PAGE) << PAGE_SHIFT;
+	/* Source GFNs in foreign domain P2M (combined with XENMAPSPACE_gmfn_foreign) */
+	xen_ulong_t h_idxs[XLATE_BATCH_SIZE];
 
-	/* Kept here for the purpose of making sure code doesn't break
-	   x86 PVOPS */
+	/* Destination GFNs in dom0's P2M. Extracted from pages[] */
+	xen_pfn_t h_gpfns[XLATE_BATCH_SIZE];
+
+	/* h_idxs and h_gpfns exist as pairs: we map into dom0's GFN the same MFN for the GFN in foreign domain. */
+
+	int h_errs[XLATE_BATCH_SIZE];
+	int mapped = 0;
+	int gfn_off = 0; /* index into gfn/err */
+	int page_off = 0; /* index into pages */
+
+	BUILD_BUG_ON(XLATE_BATCH_SIZE % XEN_PFN_PER_PAGE != 0);
 	BUG_ON(!((vma->vm_flags & (VM_PFNMAP | VM_IO)) == (VM_PFNMAP | VM_IO)));
 
-	data.fgfn = gfn;
-	data.nr_fgfn = nr;
-	data.prot  = prot;
-	data.domid = domid;
-	data.vma   = vma;
-	data.pages = pages;
-	data.index = 0;
-	data.err_ptr = err_ptr;
-	data.mapped = 0;
+	while (nr > 0) {
+		int rc, i;
 
-	err = apply_to_page_range(vma->vm_mm, addr, range,
-				  remap_pte_fn, &data);
-	return err < 0 ? err : data.mapped;
+		int batch = min(XLATE_BATCH_SIZE, nr); /* xen GFN units */
+
+		/* arm: page size may be larger than xen */
+		int batch_pages = DIV_ROUND_UP(batch, XEN_PFN_PER_PAGE);
+		unsigned long batch_range = (unsigned long)batch_pages
+					    << PAGE_SHIFT;
+
+		/* set up arguments to hypercall to edit dom0 P2M */
+
+		unsigned long xen_pfn = 0;
+
+		/* for each _source_ page in the batch (arm: pages may be larger than 4Ki) */
+		for (i = 0; i < batch; i++) {
+			if ((i % XEN_PFN_PER_PAGE) == 0) {
+				xen_pfn = page_to_xen_pfn(
+					pages[page_off + i / XEN_PFN_PER_PAGE]);
+			}
+			h_idxs[i] = gfn[gfn_off + i];
+			h_gpfns[i] = pfn_to_gfn(xen_pfn++);
+			h_errs[i] = 0;
+		}
+
+		struct xen_add_to_physmap_range xatp = {
+			.domid = DOMID_SELF,
+			.foreign_domid = domid,
+			.space = XENMAPSPACE_gmfn_foreign,
+			.size = batch,
+		};
+
+		set_xen_guest_handle(xatp.idxs, h_idxs);
+		set_xen_guest_handle(xatp.gpfns, h_gpfns);
+		set_xen_guest_handle(xatp.errs, h_errs);
+
+		rc = HYPERVISOR_memory_op(XENMEM_add_to_physmap_range, &xatp);
+
+		if (rc == 0) {
+			struct remap_pfn r = {
+				.mm = vma->vm_mm,
+				.pages = &pages[page_off],
+				.prot = prot,
+				.i = 0,
+			};
+			int err = apply_to_page_range(vma->vm_mm, addr,
+						      batch_range, remap_pfn_fn,
+						      &r);
+			if (err < 0) {
+				for (i = 0; i < batch; i++)
+					err_ptr[gfn_off + i] = err;
+				return err;
+			}
+		}
+
+		for (i = 0; i < batch; i++) {
+			int err = (rc < 0) ? rc : h_errs[i];
+			err_ptr[gfn_off + i] = err;
+			if (!err)
+				mapped++;
+		}
+
+		addr += batch_range;
+		gfn_off += batch;
+		page_off += batch_pages;
+		nr -= batch;
+		cond_resched();
+	}
+
+	return mapped;
 }
 EXPORT_SYMBOL_GPL(xen_xlate_remap_gfn_array);
 
@@ -258,25 +263,6 @@ int __init xen_xlate_map_ballooned_pages(xen_pfn_t **gfns, void **virt,
 
 	*gfns = pfns;
 	*virt = vaddr;
-
-	return 0;
-}
-
-struct remap_pfn {
-	struct mm_struct *mm;
-	struct page **pages;
-	pgprot_t prot;
-	unsigned long i;
-};
-
-static int remap_pfn_fn(pte_t *ptep, unsigned long addr, void *data)
-{
-	struct remap_pfn *r = data;
-	struct page *page = r->pages[r->i];
-	pte_t pte = pte_mkspecial(pfn_pte(page_to_pfn(page), r->prot));
-
-	set_pte_at(r->mm, addr, ptep, pte);
-	r->i++;
 
 	return 0;
 }
