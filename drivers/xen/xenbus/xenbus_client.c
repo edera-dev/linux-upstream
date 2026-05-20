@@ -31,21 +31,28 @@
  */
 
 #include <linux/mm.h>
+#include <linux/numa.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/spinlock.h>
 #include <linux/vmalloc.h>
 #include <linux/export.h>
+#include <asm/xen/hypercall.h>
 #include <asm/xen/hypervisor.h>
 #include <xen/page.h>
 #include <xen/interface/xen.h>
 #include <xen/interface/event_channel.h>
+#include <xen/interface/memory.h>
 #include <xen/balloon.h>
 #include <xen/events.h>
 #include <xen/grant_table.h>
 #include <xen/xenbus.h>
 #include <xen/xen.h>
 #include <xen/features.h>
+
+#ifdef CONFIG_XEN_BACKEND_NUMA_AFFINITY
+#include <acpi/acpi_numa.h>
+#endif
 
 #include "xenbus.h"
 
@@ -67,6 +74,7 @@ struct xenbus_map_node {
 	};
 	grant_handle_t handles[XENBUS_MAX_RING_GRANTS];
 	unsigned int   nr_handles;
+	int            host_node;	/* Linux node id of foreign frame, or NUMA_NO_NODE */
 };
 
 struct map_ring_valloc {
@@ -84,6 +92,72 @@ struct map_ring_valloc {
 
 static DEFINE_SPINLOCK(xenbus_valloc_lock);
 static LIST_HEAD(xenbus_valloc_pages);
+
+#ifdef CONFIG_XEN_BACKEND_NUMA_AFFINITY
+/*
+ * Tri-state cache for XENMEM_get_mfn_pxms availability.  -ENOSYS from
+ * the first attempt latches "unsupported", short-circuiting future
+ * calls.  Any positive ACK (including the legitimate XEN_INVALID_NUMA_ID
+ * answer for an MFN Xen does not know about) latches "supported".
+ *
+ * Lock-free: at most one transition each direction, and "unsupported"
+ * is a stable terminal state once entered.  A racing reader might
+ * issue one redundant hypercall before observing the cached state,
+ * which is harmless.
+ */
+#define XEN_MFN_PXM_UNKNOWN     0
+#define XEN_MFN_PXM_SUPPORTED   1
+#define XEN_MFN_PXM_UNSUPPORTED 2
+
+static int xen_mfn_pxm_state = XEN_MFN_PXM_UNKNOWN;
+
+/*
+ * Resolve one foreign MFN to a Linux node id.  Returns NUMA_NO_NODE
+ * for any failure mode: hypercall unsupported, MFN unknown to Xen,
+ * PXM not registered with the dom0 ACPI namespace.
+ *
+ * Three NUMA identifier namespaces are involved here.  Xen returns
+ * host PXM (firmware-supplied).  pxm_to_node() translates to a Linux
+ * dom0 node id.  Callers then use the result against Linux helpers
+ * like cpumask_of_node() and kthread_create_on_node().
+ */
+static int xenbus_query_mfn_node(unsigned long mfn)
+{
+	struct xen_get_mfn_pxms req;
+	xen_pfn_t mfn_arg = mfn;
+	uint32_t pxm = XEN_INVALID_NUMA_ID;
+	int rc;
+
+	if (READ_ONCE(xen_mfn_pxm_state) == XEN_MFN_PXM_UNSUPPORTED)
+		return NUMA_NO_NODE;
+
+	memset(&req, 0, sizeof(req));
+	set_xen_guest_handle(req.mfns, &mfn_arg);
+	set_xen_guest_handle(req.pxms, &pxm);
+	req.nr_mfns = 1;
+
+	rc = HYPERVISOR_memory_op(XENMEM_get_mfn_pxms, &req);
+	if (rc < 0) {
+		if (rc == -ENOSYS) {
+			WRITE_ONCE(xen_mfn_pxm_state, XEN_MFN_PXM_UNSUPPORTED);
+			pr_info("xenbus: hypervisor lacks XENMEM_get_mfn_pxms, backend NUMA affinity disabled\n");
+		}
+		return NUMA_NO_NODE;
+	}
+
+	WRITE_ONCE(xen_mfn_pxm_state, XEN_MFN_PXM_SUPPORTED);
+
+	if (pxm == XEN_INVALID_NUMA_ID)
+		return NUMA_NO_NODE;
+
+	return pxm_to_node(pxm);
+}
+#else
+static int xenbus_query_mfn_node(unsigned long mfn)
+{
+	return NUMA_NO_NODE;
+}
+#endif /* CONFIG_XEN_BACKEND_NUMA_AFFINITY */
 
 struct xenbus_ring_ops {
 	int (*map)(struct xenbus_device *dev, struct map_ring_valloc *info,
@@ -678,6 +752,8 @@ static int xenbus_map_ring_hvm(struct xenbus_device *dev,
 	bool leaked = false;
 	unsigned int nr_pages = XENBUS_PAGES(nr_grefs);
 
+	node->host_node = NUMA_NO_NODE;
+
 	err = xen_alloc_unpopulated_pages(nr_pages, node->hvm.pages);
 	if (err)
 		goto out_err;
@@ -692,6 +768,17 @@ static int xenbus_map_ring_hvm(struct xenbus_device *dev,
 
 	if (err)
 		goto out_free_ballooned_pages;
+
+	/*
+	 * Xen unconditionally fills dev_bus_addr with the foreign frame's
+	 * machine address on a successful host_map (see grant_table.c in
+	 * the hypervisor).  Pick up the first ring page's MFN and resolve
+	 * it now while we still have the map info; the result is cached on
+	 * the xenbus_map_node so backends can look it up cheaply later.
+	 */
+	if (nr_grefs > 0)
+		node->host_node = xenbus_query_mfn_node(
+			PFN_DOWN(info->map[0].dev_bus_addr));
 
 	addr = vmap(node->hvm.pages, nr_pages, VM_MAP | VM_IOREMAP,
 		    PAGE_KERNEL);
@@ -743,6 +830,27 @@ int xenbus_unmap_ring_vfree(struct xenbus_device *dev, void *vaddr)
 }
 EXPORT_SYMBOL_GPL(xenbus_unmap_ring_vfree);
 
+int xenbus_ring_host_node(struct xenbus_device *dev, void *vaddr)
+{
+	struct xenbus_map_node *node;
+	int node_id = NUMA_NO_NODE;
+
+	spin_lock(&xenbus_valloc_lock);
+	list_for_each_entry(node, &xenbus_valloc_pages, next) {
+		void *addr = xen_pv_domain() ? node->pv.area->addr
+					     : node->hvm.addr;
+
+		if (addr == vaddr) {
+			node_id = node->host_node;
+			break;
+		}
+	}
+	spin_unlock(&xenbus_valloc_lock);
+
+	return node_id;
+}
+EXPORT_SYMBOL_GPL(xenbus_ring_host_node);
+
 #ifdef CONFIG_XEN_PV
 static int map_ring_apply(pte_t *pte, unsigned long addr, void *data)
 {
@@ -762,6 +870,9 @@ static int xenbus_map_ring_pv(struct xenbus_device *dev,
 	struct vm_struct *area;
 	bool leaked = false;
 	int err = -ENOMEM;
+
+	/* PV dom0 is not a NUMA-affinity target; leave the value unset. */
+	node->host_node = NUMA_NO_NODE;
 
 	area = get_vm_area(XEN_PAGE_SIZE * nr_grefs, VM_IOREMAP);
 	if (!area)
